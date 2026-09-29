@@ -126,14 +126,14 @@
     <div class="sub">Plaque de Chladni — le sable se dépose sur les lignes nodales (zones immobiles) de la plaque vibrante.</div>
 
     <div class="freq-display">
-      <div class="big" id="freqBig">495<span>Hz</span></div>
+      <div class="big" id="freqBig">649<span>Hz</span></div>
       <div class="mode" id="modeInfo">Mode <b>(2, 3)</b> — figure de Chladni</div>
       <div class="res" id="resBadge">hors résonance</div>
     </div>
 
     <div class="row">
-      <label>Fréquence <span class="val" id="freqVal">495 Hz</span></label>
-      <input type="range" id="freq" min="80" max="3000" value="495" step="1" />
+      <label>Fréquence <span class="val" id="freqVal">649 Hz</span></label>
+      <input type="range" id="freq" min="80" max="3000" value="649" step="1" />
     </div>
 
     <div class="presets" id="presets"></div>
@@ -186,7 +186,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 /* ═══════════════════ État ═══════════════════ */
 const state = {
-  freq: 495,
+  freq: 649, // = f(2,3) : démarre directement en résonance
   amp: 1.0,
   sandTarget: 12000,
   plateScale: 1.0,
@@ -226,8 +226,9 @@ function nearestMode(f) {
     const err = Math.abs(md.f - f);
     if (err < bestErr) { bestErr = err; best = md; }
   }
-  // Largeur de résonance : bande passante ~2.5% de la fréquence
-  const bw = Math.max(8, best.f * 0.025);
+  // Largeur de résonance : ~2.5% de la fréquence, avec un plancher de 30 Hz
+  // pour que le bas du curseur (modes graves espacés) reste vivant
+  const bw = Math.max(30, best.f * 0.025);
   const resonance = Math.max(0, 1 - bestErr / bw);
   return { mode: best, resonance, err: bestErr };
 }
@@ -245,6 +246,18 @@ function chladni(x, y, m, n) {
   }
   return Math.cos(m * PI * x) * Math.cos(n * PI * y)
        - Math.cos(n * PI * x) * Math.cos(m * PI * y);
+}
+
+/* Gradient analytique ∇w (dérivées exactes, vérifiées contre différences finies) */
+function chladniGradX(x, y, m, n) {
+  const mp = m * Math.PI, np = n * Math.PI;
+  if (m === n) return -2 * mp * Math.sin(mp * x) * Math.cos(mp * y);
+  return -mp * Math.sin(mp * x) * Math.cos(np * y) + np * Math.sin(np * x) * Math.cos(mp * y);
+}
+function chladniGradZ(x, y, m, n) {
+  const mp = m * Math.PI, np = n * Math.PI;
+  if (m === n) return -2 * mp * Math.cos(mp * x) * Math.sin(mp * y);
+  return -np * Math.cos(mp * x) * Math.sin(np * y) + mp * Math.cos(np * x) * Math.sin(mp * y);
 }
 
 /* ═══════════════════ Three.js ═══════════════════ */
@@ -385,7 +398,7 @@ function resetSand() {
     sandPositions[i * 3 + 1] = 0.012;
     sandPositions[i * 3 + 2] = pz[i];
   }
-  if (sandGeo) sandGeo.attributes.position.needsUpdate = true;
+  sandGeo.attributes.position.needsUpdate = true;
 }
 
 /* Géométrie des points de sable */
@@ -421,7 +434,6 @@ scene.add(sandPoints);
 function simulate(dt, time) {
   const [m, n] = state.mode;
   const amp = state.amp * state.resonance; // pas de force hors résonance
-  const e = 0.012; // pas pour gradient numérique
 
   // Fréquence de secousse visuelle (ralentie : on ne voit pas 500 Hz)
   const shakeFreq = 14 + state.freq * 0.01;
@@ -435,10 +447,10 @@ function simulate(dt, time) {
     const x = px[i];
     const z = pz[i];
 
-    // amplitude locale et gradient de |u|
+    // amplitude locale et gradient analytique (≈5× moins d'évaluations que par différences finies)
     const u = chladni(x, z, m, n);
-    const du_dx = (chladni(x + e, z, m, n) - chladni(x - e, z, m, n)) / (2 * e);
-    const du_dz = (chladni(x, z + e, m, n) - chladni(x, z - e, m, n)) / (2 * e);
+    const du_dx = chladniGradX(x, z, m, n);
+    const du_dz = chladniGradZ(x, z, m, n);
 
     // force de dérive : -∇(u²)/2 = -u·∇u  (va vers les nœuds)
     const fx = -u * du_dx;
@@ -468,32 +480,43 @@ function simulate(dt, time) {
     px[i] = nx;
     pz[i] = nz;
 
-    // hauteur : suit la déformation de la plaque + petit rebond
-    const h = chladni(nx, nz, m, n) * 0.04 * amp * Math.sin(time * shakeFreq)
-            + absU * amp * 0.008 * Math.abs(shakePhase);
+    // hauteur : colle à la déformation réelle de la plaque + petit rebond aux antinœuds
+    const plateH = chladni(nx, nz, m, n) * 0.015 * state.amp
+                 * (0.25 + 0.75 * state.resonance) * shakePhase;
+    const bounce = absU * amp * 0.008 * Math.abs(shakePhase);
     sandPositions[i * 3 + 0] = nx;
-    sandPositions[i * 3 + 1] = 0.012 + Math.max(0, h);
+    sandPositions[i * 3 + 1] = 0.012 + plateH + bounce;
     sandPositions[i * 3 + 2] = nz;
   }
   sandGeo.attributes.position.needsUpdate = true;
 }
 
-/* Déformation de la plaque */
+/* Déformation de la plaque (normales analytiques — plus de computeVertexNormals par frame) */
 function deformPlate(time) {
   const [m, n] = state.mode;
   const pos = plateGeo.attributes.position;
+  const nor = plateGeo.attributes.normal;
   const arr = pos.array;
+  const narr = nor.array;
   // chladni ∈ [−2,2] → on normalise pour limiter le débattement
   const scale = 0.03 * state.amp * (0.25 + 0.75 * state.resonance);
   const phase = Math.sin(time * (14 + state.freq * 0.01));
+  const c = 0.5 * scale * phase; // pente : ∂y/∂x = c · ∂w/∂x
 
   for (let i = 0; i < pos.count; i++) {
     const x = arr[i * 3 + 0];
     const z = arr[i * 3 + 2];
     arr[i * 3 + 1] = (chladni(x, z, m, n) * 0.5) * scale * phase;
+    // normale exacte d'un champ de hauteur : n ∝ (−∂y/∂x, 1, −∂y/∂z)
+    const dydx = c * chladniGradX(x, z, m, n);
+    const dydz = c * chladniGradZ(x, z, m, n);
+    const inv = 1 / Math.sqrt(1 + dydx * dydx + dydz * dydz);
+    narr[i * 3 + 0] = -dydx * inv;
+    narr[i * 3 + 1] = inv;
+    narr[i * 3 + 2] = -dydz * inv;
   }
   pos.needsUpdate = true;
-  plateGeo.computeVertexNormals();
+  nor.needsUpdate = true;
 }
 
 /* ═══════════════════ UI ═══════════════════ */
@@ -645,7 +668,7 @@ function updateSound() {
   const t = audioCtx.currentTime;
   audioOsc.frequency.setTargetAtTime(state.freq, t, 0.03);
   // volume : silence hors résonance, soutenu en résonance
-  const vol = 0.001 + 0.14 * state.amp * state.resonance * state.resonance;
+  const vol = state.paused ? 0 : 0.001 + 0.14 * state.amp * state.resonance * state.resonance;
   audioGain.gain.setTargetAtTime(vol, t, 0.08);
 }
 
